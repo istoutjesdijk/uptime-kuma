@@ -1,0 +1,108 @@
+name: authentik-sync
+
+# Keeps the Authentik proxy outpost current: daily, the newest stable release,
+# checked here before it is merged. The outpost tracks upstream on its own
+# rather than being told what to run by the deployment it guards.
+#
+# The optional version input pins an exact version -- the way back if a release
+# turns out badly, and the way to line this outpost up with a server that is
+# deliberately held on an older version.
+#
+# The gate runs in this workflow rather than on the pull request: a pull request
+# opened with GITHUB_TOKEN triggers no workflows, so a check waiting on the PR
+# would never run.
+
+on:
+  schedule:
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Pin this exact version instead of the newest stable release"
+        required: false
+        type: string
+
+concurrency:
+  group: authentik-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve the target version
+        id: target
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          cur="$(cat .authentik-ref)"
+          if [ -n "${INPUT:-}" ]; then
+            target="$INPUT"
+          else
+            # Authentik keeps shipping patches on older minors after a new minor
+            # is out, so "latest release" is not the same as "latest version" and
+            # regularly points backwards. Sort the stable tags and take the top.
+            target="$(gh api 'repos/goauthentik/authentik/releases?per_page=100' \
+                        --jq '.[] | select(.prerelease == false) | .tag_name' \
+                      | sed 's#^version/##' \
+                      | grep -E '^[0-9]{4}\.[0-9]+\.[0-9]+$' \
+                      | sort -V | tail -1)"
+          fi
+          if ! printf '%s' "$target" | grep -Eq '^[0-9]{4}\.[0-9]+\.[0-9]+$'; then
+            echo "::error::unexpected version '${target}'"; exit 1
+          fi
+          # Never walk backwards on an unattended run; a downgrade of the outpost
+          # would be silent and would only show up as broken logins.
+          if [ -z "${INPUT:-}" ] && [ "$(printf '%s\n%s\n' "$cur" "$target" | sort -V | tail -1)" != "$target" ]; then
+            echo "::error::resolved ${target}, which is older than the pinned ${cur}"; exit 1
+          fi
+          echo "current=${cur}" >> "$GITHUB_OUTPUT"
+          echo "target=${target}" >> "$GITHUB_OUTPUT"
+
+      - name: Bump when it differs
+        id: bump
+        env:
+          CUR: ${{ steps.target.outputs.current }}
+          NEW: ${{ steps.target.outputs.target }}
+        run: |
+          set -euo pipefail
+          if [ "$CUR" = "$NEW" ]; then
+            echo "Already on ${CUR} -- nothing to do."; exit 0
+          fi
+          echo "Bump ${CUR} -> ${NEW}"
+          sed -E -i "s#(AUTHENTIK_TAG:-)[0-9]{4}\.[0-9]+\.[0-9]+#\1${NEW}#g" compose.yml
+          sed -E -i "s#(AUTHENTIK_TAG=)[0-9]{4}\.[0-9]+\.[0-9]+#\1${NEW}#g" .env.example
+          printf '%s\n' "$NEW" > .authentik-ref
+          # Fail loudly if the substitution missed, rather than merging a commit
+          # that leaves the deployment on the old tag.
+          grep -q "AUTHENTIK_TAG:-${NEW}}" compose.yml
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Gate
+        if: steps.bump.outputs.changed == 'true'
+        run: ./ci/outpost-check.sh "${{ steps.target.outputs.target }}"
+
+      - name: Open and merge
+        if: steps.bump.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEW: ${{ steps.target.outputs.target }}
+        run: |
+          set -euo pipefail
+          branch="bump/authentik-proxy-${NEW}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git commit -am "Update the Authentik proxy outpost to ${NEW}"
+          git push -u origin "$branch"
+          gh pr create --base main --head "$branch" --title "Update the Authentik proxy outpost to ${NEW}" --body "Checked before merging: the image tag exists, compose.yml and .authentik-ref agree, and the health check command still exists inside the image."
+          gh pr merge "$branch" --squash --delete-branch

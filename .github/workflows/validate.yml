@@ -1,0 +1,166 @@
+name: validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: validate-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  compose-lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Validate compose.yml (render + labels)
+        # `config` only renders and interpolates -- it builds and pulls nothing.
+        # Dummy values for the required secrets so interpolation succeeds.
+        env:
+          MARIADB_SERVER: ci-dummy-host
+          MARIADB_PASSWORD: ci-dummy-password
+          AUTHENTIK_HOST: https://authentik.invalid
+          AUTHENTIK_OUTPOST_TOKEN: ci-dummy-token
+        run: docker compose -f compose.yml config --quiet
+
+      - name: Check version consistency
+        run: |
+          ref="$(cat .upstream-ref)"
+          echo "Expected version: $ref"
+          grep -q "UPTIME_KUMA_TAG:-${ref}" compose.yml
+          echo "OK: compose tag matches .upstream-ref"
+
+  outpost:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check the Authentik proxy pin
+        # Same script the hourly sync runs before it merges, so a hand-edited
+        # pin is held to the same bar as an automatic one.
+        run: ./ci/outpost-check.sh
+
+  smoke:
+    runs-on: ubuntu-latest
+    needs: compose-lint
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Boot Uptime Kuma against a throwaway MariaDB
+        run: |
+          set -e
+          ver="$(cat .upstream-ref)"
+          docker network create kuma-smoke
+          docker run -d --name kuma-db --network kuma-smoke \
+            -e MARIADB_ROOT_PASSWORD=smoke-root \
+            -e MARIADB_DATABASE=kuma \
+            -e MARIADB_USER=kuma \
+            -e MARIADB_PASSWORD=smoke \
+            mariadb:11
+          echo "Waiting for MariaDB..."
+          for i in $(seq 1 30); do
+            if docker exec kuma-db mariadb-admin ping -h 127.0.0.1 -u kuma -psmoke --silent 2>/dev/null; then
+              echo "MariaDB up after $i attempts"; break
+            fi
+            sleep 2
+          done
+          # Exactly the environment the compose file hands the container, so a
+          # version bump that breaks the MariaDB path is caught here and not in
+          # production.
+          docker run -d --name kuma-app --network kuma-smoke \
+            -e UPTIME_KUMA_DB_TYPE=mariadb \
+            -e UPTIME_KUMA_DB_HOSTNAME=kuma-db \
+            -e UPTIME_KUMA_DB_PORT=3306 \
+            -e UPTIME_KUMA_DB_NAME=kuma \
+            -e UPTIME_KUMA_DB_USERNAME=kuma \
+            -e UPTIME_KUMA_DB_PASSWORD=smoke \
+            -p 3001:3001 "louislam/uptime-kuma:${ver}"
+          echo "Waiting for Uptime Kuma to respond..."
+          ok=0
+          for i in $(seq 1 40); do
+            code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3001/ || true)"
+            echo "attempt $i -> HTTP $code"
+            case "$code" in 200|302) ok=1; break;; esac
+            sleep 5
+          done
+          if [ "$ok" != "1" ]; then
+            echo "::error::Uptime Kuma did not come up"; docker logs kuma-app; exit 1
+          fi
+          echo "Smoke OK"
+
+      - name: Assert it actually reached MariaDB, not SQLite
+        run: |
+          set -e
+          # Kuma falls back to its setup wizard when the database is unreachable,
+          # and the wizard answers HTTP 200 just as happily as a working install.
+          # The only proof that the MariaDB path worked is a populated schema.
+          tables="$(docker exec kuma-db mariadb -u kuma -psmoke -N -B \
+                     -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='kuma';")"
+          echo "tables in kuma schema: $tables"
+          if [ "$tables" -lt 5 ]; then
+            echo "::error::Uptime Kuma did not create its schema in MariaDB"
+            docker logs kuma-app; exit 1
+          fi
+          echo "MariaDB schema OK"
+
+      - name: Health check runs inside the container
+        run: |
+          set -e
+          # Coolify evaluates the health check INSIDE the container and derives
+          # the app status from it. An image that lacks the command the check
+          # calls fails every probe silently and the whole app turns
+          # "running:unhealthy". Assert the exact command from the compose file
+          # against the running upstream image, so an automated version bump
+          # cannot quietly remove the binary from under us.
+          export MARIADB_SERVER=x MARIADB_PASSWORD=x AUTHENTIK_HOST=https://authentik.invalid AUTHENTIK_OUTPOST_TOKEN=x
+          cmd="$(docker compose -f compose.yml config --format json \
+                 | python3 -c 'import json,sys; print(" ".join(json.load(sys.stdin)["services"]["uptime-kuma"]["healthcheck"]["test"][1:]))')"
+          echo "health check: $cmd"
+          # `docker exec` without -u runs as the image user, like the real probe.
+          if ! docker exec kuma-app sh -c "$cmd"; then
+            echo "::error::Uptime Kuma health check fails inside the container"
+            docker logs kuma-app; exit 1
+          fi
+          echo "Health check OK"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker rm -f kuma-app kuma-db 2>/dev/null || true
+          docker network rm kuma-smoke 2>/dev/null || true
+
+  notify-failure:
+    runs-on: ubuntu-latest
+    needs: [compose-lint, outpost, smoke]
+    if: failure() && github.event_name != 'pull_request'
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/github-script@v9
+        with:
+          script: |
+            const title = 'ci-failure: validate workflow is failing';
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', labels: 'ci-failure',
+            });
+            const body = `Run failed: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            if (issues.length) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: issues[0].number, body });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner, repo: context.repo.repo,
+                title, body, labels: ['ci-failure'] });
+            }

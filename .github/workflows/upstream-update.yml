@@ -1,0 +1,67 @@
+name: upstream-update
+
+# Self-maintenance: checks daily for a new stable Uptime Kuma release, bumps the
+# pinned tag in compose.yml plus .upstream-ref, and pushes. The push triggers an
+# automatic redeploy on the platform (git webhook).
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: upstream-update
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve latest Uptime Kuma release
+        id: rel
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="$(gh api repos/louislam/uptime-kuma/releases/latest --jq .tag_name)"
+          ver="${tag#v}"
+          # Guard against pre-releases and anything else unexpected upstream:
+          # a bad tag here would be pushed straight into production.
+          if ! printf '%s' "$ver" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Unexpected release tag: '$tag' -- aborting."; exit 1
+          fi
+          # Major-version jumps are breaking (2.0 changed the database layer);
+          # they get a manual review rather than an unattended redeploy.
+          cur_major="$(cut -d. -f1 < .upstream-ref)"
+          new_major="${ver%%.*}"
+          if [ "$cur_major" != "$new_major" ]; then
+            echo "::warning::Major bump ${cur_major} -> ${new_major} detected; not applied automatically."
+            exit 0
+          fi
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+
+      - name: Bump when changed
+        if: steps.rel.outputs.version != ''
+        env:
+          NEW: ${{ steps.rel.outputs.version }}
+        run: |
+          CUR="$(cat .upstream-ref)"
+          if [ "$CUR" = "$NEW" ]; then
+            echo "Already on $CUR -- nothing to do."; exit 0
+          fi
+          echo "Bump $CUR -> $NEW"
+          sed -E -i "s#(UPTIME_KUMA_TAG:-)[0-9]+\.[0-9]+\.[0-9]+#\1${NEW}#g" compose.yml
+          sed -E -i "s#(UPTIME_KUMA_TAG=)[0-9]+\.[0-9]+\.[0-9]+#\1${NEW}#g" .env.example
+          printf '%s\n' "$NEW" > .upstream-ref
+          # Fail loudly if the substitution missed, instead of pushing a no-op
+          # commit that silently leaves production on the old tag.
+          grep -q "UPTIME_KUMA_TAG:-${NEW}" compose.yml
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Update Uptime Kuma to ${NEW}"
+          git push

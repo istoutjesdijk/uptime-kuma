@@ -1,0 +1,23 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: ci
+
+  # Both images in compose.yml are owned by a workflow, so Dependabot only has
+  # the Actions left to bump. upstream-update.yml follows the official stable
+  # Uptime Kuma releases, and authentik-sync.yml follows the version the
+  # Authentik server is actually running -- a Dependabot bump of the proxy image
+  # would ignore that and could push the outpost ahead of the server.
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: deps
+    ignore:
+      - dependency-name: "louislam/uptime-kuma"
+      - dependency-name: "ghcr.io/goauthentik/proxy"

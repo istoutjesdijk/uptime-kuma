@@ -1,0 +1,110 @@
+# Uptime Kuma production stack for Coolify (Docker Compose build pack).
+#
+# Two containers, one Coolify app:
+#
+#   uptime-kuma  the app itself; internal only, no domain of its own
+#   outpost      Authentik proxy outpost; the ONLY published container, holds
+#                the public domain and is the single way in
+#
+# No published ports and no Traefik routers here: Coolify supplies the reverse
+# proxy and TLS through the domain you set per service in its UI. No in-compose
+# database either -- MariaDB runs as a separate Coolify-managed resource in the
+# same destination network (easier to back up, survives every redeploy) and is
+# reached through the MARIADB_* variables, where MARIADB_SERVER is that
+# resource's uuid hostname. Turn on "Connect to Predefined Network" for that;
+# without it the stack sits in its own isolated network and the hostname will
+# not resolve.
+#
+# Uptime Kuma has no built-in SSO -- OIDC has been an open feature request since
+# 2021 (louislam/uptime-kuma#553). The supported route is a proxy in front with
+# Kuma's own login switched off. Note that there is NO environment variable for
+# that: `UPTIME_KUMA_DISABLE_AUTH` circulates on forums but does not exist in the
+# source. It is a one-off UI action, after the first admin account is created:
+# Settings > Security > Advanced > Disable Auth. Also set Settings > Reverse
+# Proxy > Trust Proxy to Yes, otherwise every visit is logged with the reverse
+# proxy's IP. Be aware that disabling auth also disables Kuma's API keys; push
+# monitors (/api/push/<token>) keep working.
+#
+# Values without a default below must be set in the platform's env editor; they
+# are deliberately NOT in this repo:
+#   MARIADB_SERVER           (uuid hostname of the database resource)
+#   MARIADB_PASSWORD         (password of the database resource)
+#   AUTHENTIK_HOST           (base URL of the Authentik server)
+#   AUTHENTIK_OUTPOST_TOKEN  (token of the outpost in Authentik)
+
+services:
+
+  # Uptime Kuma. Reachable only through the outpost, so it gets no domain in
+  # Coolify and exposes nothing to the host.
+  uptime-kuma:
+    image: ${UPTIME_KUMA_IMAGE:-louislam/uptime-kuma}:${UPTIME_KUMA_TAG:-2.5.4}
+    restart: unless-stopped
+    environment:
+      # With these set, the first-run wizard skips its database screen and goes
+      # straight to creating the admin account. Kuma 2 speaks only sqlite and
+      # mariadb -- PostgreSQL is not supported.
+      UPTIME_KUMA_DB_TYPE: mariadb
+      UPTIME_KUMA_DB_HOSTNAME: ${MARIADB_SERVER:?uuid hostname of the database resource required}
+      UPTIME_KUMA_DB_PORT: ${MARIADB_PORT:-3306}
+      UPTIME_KUMA_DB_NAME: ${MARIADB_DATABASE:-kuma}
+      UPTIME_KUMA_DB_USERNAME: ${MARIADB_USER:-kuma}
+      UPTIME_KUMA_DB_PASSWORD: ${MARIADB_PASSWORD:?database password required}
+      TZ: ${TZ:-Etc/UTC}
+    expose:
+      - "3001"
+    volumes:
+      # Still needed with an external database: db-config.json, uploaded status
+      # page icons and any TLS material live here.
+      - uptime-kuma-data:/app/data
+    healthcheck:
+      # Coolify runs the health check INSIDE the container and derives the app
+      # status from it, so the command has to exist in the image. This Go binary
+      # ships with the image and WORKDIR is /app; it honours the same host/port
+      # settings as the server, so it keeps working if those ever change.
+      test: ["CMD", "extra/healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      # Generous: on an empty database Kuma runs its migrations first.
+      start_period: 90s
+
+  # Authentik proxy outpost: sits in front of Uptime Kuma and lets only signed-in
+  # users through. Runs in "Proxy" mode, so it forwards to the upstream itself
+  # (internal host `http://uptime-kuma:3001`, configured in Authentik). That is
+  # why there are no forwardAuth labels on the Coolify app -- Coolify strips
+  # those in some setups, and that failure mode fails *open*.
+  outpost:
+    image: ${AUTHENTIK_PROXY_IMAGE:-ghcr.io/goauthentik/proxy}:${AUTHENTIK_TAG:-2026.8.0}
+    restart: unless-stopped
+    depends_on:
+      uptime-kuma:
+        condition: service_healthy
+    environment:
+      # The outpost dials out to Authentik (websocket + API) and pulls its
+      # provider configuration from there. Upstream requires the outpost and the
+      # server to run the same version; authentik-sync.yml keeps AUTHENTIK_TAG
+      # in step with whatever the server is actually serving.
+      AUTHENTIK_HOST: ${AUTHENTIK_HOST:?base URL of the Authentik server required}
+      AUTHENTIK_INSECURE: "false"
+      AUTHENTIK_TOKEN: ${AUTHENTIK_OUTPOST_TOKEN:?outpost token from Authentik required}
+    expose:
+      - "9000"
+    labels:
+      # Only relevant when TLS terminates in front of the reverse proxy (a CDN
+      # or a tunnel). The proxy then sees a plain-HTTP peer on a private IP,
+      # does not trust it, and overwrites its X-Forwarded-* headers -- so the
+      # outpost reads scheme=http while the browser is on https and builds
+      # broken redirect URIs. Drop these two labels if TLS terminates at Traefik
+      # itself.
+      - "traefik.http.middlewares.kuma-https.headers.customrequestheaders.X-Forwarded-Proto=https"
+      - "coolify.traefik.middlewares=kuma-https"
+    healthcheck:
+      # Shipped with the image; verifies the connection to Authentik.
+      test: ["CMD", "/authentik", "healthcheck", "proxy"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+volumes:
+  uptime-kuma-data:
