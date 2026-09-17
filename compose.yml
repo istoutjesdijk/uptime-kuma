@@ -37,7 +37,7 @@ services:
   # Uptime Kuma. Reachable only through the outpost, so it gets no domain in
   # Coolify and exposes nothing to the host.
   uptime-kuma:
-    image: ${UPTIME_KUMA_IMAGE:-louislam/uptime-kuma}:${UPTIME_KUMA_TAG:-2.5.4}
+    image: ${UPTIME_KUMA_IMAGE:-louislam/uptime-kuma}:${UPTIME_KUMA_TAG:-2.5.5}
     restart: unless-stopped
     environment:
       # With these set, the first-run wizard skips its database screen and goes
