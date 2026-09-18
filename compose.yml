@@ -74,7 +74,7 @@ services:
   # why there are no forwardAuth labels on the Coolify app -- Coolify strips
   # those in some setups, and that failure mode fails *open*.
   outpost:
-    image: ${AUTHENTIK_PROXY_IMAGE:-ghcr.io/goauthentik/proxy}:${AUTHENTIK_TAG:-2026.8.2}
+    image: ${AUTHENTIK_PROXY_IMAGE:-ghcr.io/goauthentik/proxy}:${AUTHENTIK_TAG:-2026.8.3}
     restart: unless-stopped
     depends_on:
       uptime-kuma:
